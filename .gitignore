@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+options_progress.json
+opciones_download.log
