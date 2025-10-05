@@ -17,6 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 API_URL = "https://api.polygon.io/v3/reference/options/contracts"
+OPEN_CLOSE_URL = "https://api.polygon.io/v1/open-close"
 PROGRESS_FILE = Path("options_progress.json")
 LOG_FILE = Path("opciones_download.log")
 RATE_LIMIT_SECONDS = 12.5
@@ -39,6 +40,22 @@ class OptionRecord:
     cantidad_adicional: List[Optional[Decimal]]
     tipo_adicional: List[Optional[str]]
     tipo_subyacente_adicional: List[Optional[str]]
+
+
+@dataclass
+class OptionOHLCRecord:
+    fecha_inicio: _dt.datetime
+    id_opcion: str
+    open: Optional[Decimal]
+    high: Optional[Decimal]
+    low: Optional[Decimal]
+    close: Optional[Decimal]
+    precio_premercado: Optional[Decimal]
+    precio_afterhours: Optional[Decimal]
+    volume: Optional[int]
+    status: Optional[str]
+    symbol: str
+    asset_id: str
 
 
 class ProgressTracker:
@@ -206,6 +223,254 @@ class PolygonOptionsDownloader:
             return None
         return next_url.split("cursor=")[-1].split("&")[0] or None
 
+    def _insert_contract(
+        self,
+        conn: psycopg.Connection,
+        cur: psycopg.Cursor,
+        record: OptionRecord,
+    ) -> bool:
+        params = (
+            record.cfi,
+            record.tipo_contrato,
+            record.estilo_opcion,
+            record.fecha_expiracion,
+            record.mercado,
+            record.acciones_por_contrato,
+            record.precio_strike,
+            record.id_opcion,
+            record.symbol,
+            record.asset_id,
+            FUENTE,
+            _dt.datetime.now(tz=_dt.timezone.utc),
+            *record.cantidad_adicional,
+            *record.tipo_adicional,
+            *record.tipo_subyacente_adicional,
+        )
+        try:
+            cur.execute(
+                """
+                INSERT INTO opciones (
+                    cfi,
+                    tipo_contrato,
+                    estilo_opcion,
+                    fecha_expiracion,
+                    mercado,
+                    acciones_por_contrato,
+                    precio_strike,
+                    id_opcion,
+                    symbol,
+                    asset_id,
+                    fuente,
+                    fecha_insercion,
+                    cantidad_adicional_1,
+                    cantidad_adicional_2,
+                    cantidad_adicional_3,
+                    tipo_adicional_1,
+                    tipo_adicional_2,
+                    tipo_adicional_3,
+                    tipo_subyacente_adicional_1,
+                    tipo_subyacente_adicional_2,
+                    tipo_subyacente_adicional_3
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (id_opcion) DO NOTHING
+                """,
+                params,
+            )
+            conn.commit()
+            return bool(cur.rowcount)
+        except psycopg.DatabaseError as exc:
+            conn.rollback()
+            self.logger.error(
+                "Error al insertar contrato %s: %s",
+                record.id_opcion,
+                exc,
+                exc_info=True,
+            )
+        return False
+
+    def _ensure_open_close(
+        self,
+        conn: psycopg.Connection,
+        cur: psycopg.Cursor,
+        record: OptionRecord,
+    ) -> None:
+        if self._open_close_exists(cur, record):
+            return
+        date_str = record.fecha_expiracion.date().isoformat()
+        try:
+            raw = self._fetch_open_close(record.id_opcion, date_str)
+        except FileNotFoundError:
+            self.logger.warning(
+                "OHLC no disponible para %s en fecha %s", record.id_opcion, date_str
+            )
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            raise RuntimeError(
+                f"Fallo al descargar OHLC para {record.id_opcion} {date_str}"
+            ) from exc
+        try:
+            ohlc_record = self._validate_ohlc(raw, record)
+        except ValueError as exc:
+            self.logger.error(
+                "Datos OHLC descartados para %s: %s | Datos: %s",
+                record.id_opcion,
+                exc,
+                raw,
+            )
+            return
+        self._persist_ohlc(conn, cur, ohlc_record)
+
+    @staticmethod
+    def _open_close_exists(cur: psycopg.Cursor, record: OptionRecord) -> bool:
+        cur.execute(
+            """
+            SELECT 1
+            FROM opciones_ohlc
+            WHERE symbol = %s AND asset_id = %s AND id_opcion = %s
+            LIMIT 1
+            """,
+            (record.symbol, record.asset_id, record.id_opcion),
+        )
+        return cur.fetchone() is not None
+
+    def _fetch_open_close(self, option_ticker: str, date_str: str) -> Dict[str, Any]:
+        self._respect_rate_limit()
+        url = f"{OPEN_CLOSE_URL}/{option_ticker}/{date_str}"
+        response = self.session.get(url, timeout=30)
+        if response.status_code == requests.codes.not_found:
+            raise FileNotFoundError(response.text)
+        if response.status_code != requests.codes.ok:
+            raise RuntimeError(
+                f"Respuesta inesperada {response.status_code}: {response.text[:200]}"
+            )
+        return response.json()
+
+    def _validate_ohlc(
+        self, payload: Dict[str, Any], contract: OptionRecord
+    ) -> OptionOHLCRecord:
+        option_symbol = payload.get("symbol")
+        if option_symbol != contract.id_opcion:
+            raise ValueError("symbol del OHLC no coincide con id_opcion")
+
+        from_value = payload.get("from")
+        if not isinstance(from_value, str) or not from_value:
+            raise ValueError("Campo 'from' inválido")
+        try:
+            from_date = _dt.date.fromisoformat(from_value)
+        except ValueError as exc:
+            raise ValueError("Formato de fecha_inicio inválido") from exc
+        fecha_inicio = _dt.datetime.combine(
+            from_date, _dt.time.min, tzinfo=_dt.timezone.utc
+        )
+
+        volume_value = payload.get("volume")
+        if volume_value is not None:
+            if not isinstance(volume_value, int) or volume_value < 0:
+                raise ValueError("volume inválido")
+
+        status_value = payload.get("status")
+        if status_value is not None and not isinstance(status_value, str):
+            raise ValueError("status inválido")
+
+        return OptionOHLCRecord(
+            fecha_inicio=fecha_inicio,
+            id_opcion=contract.id_opcion,
+            open=self._optional_decimal(payload.get("open"), "open"),
+            high=self._optional_decimal(payload.get("high"), "high"),
+            low=self._optional_decimal(payload.get("low"), "low"),
+            close=self._optional_decimal(payload.get("close"), "close"),
+            precio_premercado=self._optional_decimal(
+                payload.get("preMarket"), "preMarket"
+            ),
+            precio_afterhours=self._optional_decimal(
+                payload.get("afterHours"), "afterHours"
+            ),
+            volume=volume_value,
+            status=status_value,
+            symbol=contract.symbol,
+            asset_id=contract.asset_id,
+        )
+
+    def _persist_ohlc(
+        self, conn: psycopg.Connection, cur: psycopg.Cursor, record: OptionOHLCRecord
+    ) -> None:
+        params = (
+            record.fecha_inicio,
+            record.id_opcion,
+            record.open,
+            record.high,
+            record.low,
+            record.close,
+            record.precio_premercado,
+            record.precio_afterhours,
+            record.volume,
+            record.status,
+            record.symbol,
+            record.asset_id,
+            _dt.datetime.now(tz=_dt.timezone.utc),
+        )
+        try:
+            cur.execute(
+                """
+                INSERT INTO opciones_ohlc (
+                    fecha_inicio,
+                    id_opcion,
+                    open,
+                    high,
+                    low,
+                    close,
+                    precio_premercado,
+                    precio_afterhours,
+                    volume,
+                    status,
+                    symbol,
+                    asset_id,
+                    ts_ingesta
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+                ON CONFLICT (symbol, asset_id, id_opcion) DO UPDATE SET
+                    fecha_inicio = EXCLUDED.fecha_inicio,
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    precio_premercado = EXCLUDED.precio_premercado,
+                    precio_afterhours = EXCLUDED.precio_afterhours,
+                    volume = EXCLUDED.volume,
+                    status = EXCLUDED.status,
+                    ts_ingesta = EXCLUDED.ts_ingesta
+                """,
+                params,
+            )
+            conn.commit()
+            self.logger.info(
+                "OHLC almacenado | symbol=%s id_opcion=%s fecha=%s",
+                record.symbol,
+                record.id_opcion,
+                record.fecha_inicio.date().isoformat(),
+            )
+        except psycopg.DatabaseError as exc:
+            conn.rollback()
+            raise RuntimeError(f"Error al insertar OHLC {record.id_opcion}") from exc
+
+    @staticmethod
+    def _optional_decimal(value: Any, field_name: str) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, TypeError) as exc:
+            raise ValueError(f"{field_name} inválido") from exc
+        return decimal_value.quantize(Decimal("0.0001"))
+
     def _persist_contracts(
         self,
         conn: psycopg.Connection,
@@ -226,72 +491,24 @@ class PolygonOptionsDownloader:
                         contract,
                     )
                     continue
-                params = (
-                    record.cfi,
-                    record.tipo_contrato,
-                    record.estilo_opcion,
-                    record.fecha_expiracion,
-                    record.mercado,
-                    record.acciones_por_contrato,
-                    record.precio_strike,
-                    record.id_opcion,
-                    record.symbol,
-                    record.asset_id,
-                    FUENTE,
-                    _dt.datetime.now(tz=_dt.timezone.utc),
-                    *record.cantidad_adicional,
-                    *record.tipo_adicional,
-                    *record.tipo_subyacente_adicional,
-                )
-                try:
-                    cur.execute(
-                        """
-                        INSERT INTO opciones (
-                            cfi,
-                            tipo_contrato,
-                            estilo_opcion,
-                            fecha_expiracion,
-                            mercado,
-                            acciones_por_contrato,
-                            precio_strike,
-                            id_opcion,
-                            symbol,
-                            asset_id,
-                            fuente,
-                            fecha_insercion,
-                            cantidad_adicional_1,
-                            cantidad_adicional_2,
-                            cantidad_adicional_3,
-                            tipo_adicional_1,
-                            tipo_adicional_2,
-                            tipo_adicional_3,
-                            tipo_subyacente_adicional_1,
-                            tipo_subyacente_adicional_2,
-                            tipo_subyacente_adicional_3
-                        ) VALUES (
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s
-                        )
-                        ON CONFLICT (id_opcion) DO NOTHING
-                        """,
-                        params,
+
+                new_inserted = self._insert_contract(conn, cur, record)
+                if new_inserted:
+                    inserted += 1
+                    self.logger.info(
+                        "Progreso | fecha_expiracion=%s symbol=%s id_opcion=%s total=%d",
+                        record.fecha_expiracion.isoformat(),
+                        record.symbol,
+                        record.id_opcion,
+                        inserted,
                     )
-                    if cur.rowcount:
-                        inserted += 1
-                        conn.commit()
-                        self.logger.info(
-                            "Progreso | fecha_expiracion=%s symbol=%s id_opcion=%s total=%d",
-                            record.fecha_expiracion.isoformat(),
-                            record.symbol,
-                            record.id_opcion,
-                            inserted,
-                        )
-                except psycopg.DatabaseError as exc:
+
+                try:
+                    self._ensure_open_close(conn, cur, record)
+                except Exception as exc:  # pylint: disable=broad-except
                     conn.rollback()
                     self.logger.error(
-                        "Error al insertar contrato %s: %s",
+                        "Error al procesar OHLC para %s: %s",
                         record.id_opcion,
                         exc,
                         exc_info=True,

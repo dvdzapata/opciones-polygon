@@ -1,6 +1,7 @@
 # opciones-polygon
 
 Script para descargar contratos de opciones desde la API de Polygon y guardarlos en PostgreSQL.
+Además sincroniza los datos OHLC diarios de cada contrato mediante el endpoint `/v1/open-close/{optionsTicker}/{date}` y los persiste en la tabla `opciones_ohlc`.
 
 ## Configuración
 
