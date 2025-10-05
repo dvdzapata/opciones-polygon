@@ -25,6 +25,7 @@ RATE_LIMIT_SECONDS = 12.5
 MAX_UNDERLYINGS = 3
 FUENTE = "polygon"
 HISTORY_LOOKBACK_DAYS = 365 * 2
+ONE_DAY = _dt.timedelta(days=1)
 
 
 @dataclass
@@ -139,13 +140,42 @@ class OHLCProgressTracker:
         except ValueError:
             return None
 
-    def update(self, option_id: str, date_value: _dt.date, status: str) -> None:
-        self._data[option_id] = {
-            "last_date": date_value.isoformat(),
+    def is_completed(self, option_id: str, end_date: _dt.date) -> bool:
+        entry = self._data.get(option_id)
+        if not entry:
+            return False
+        if not entry.get("completed"):
+            return False
+        last_date = entry.get("last_date")
+        if not last_date:
+            return False
+        try:
+            stored_date = _dt.date.fromisoformat(last_date)
+        except ValueError:
+            return False
+        return stored_date >= end_date
+
+    def update(
+        self,
+        option_id: str,
+        date_value: Optional[_dt.date],
+        status: str,
+        completed: bool,
+    ) -> None:
+        payload: Dict[str, Any] = {
             "status": status,
+            "completed": completed,
             "timestamp": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
         }
+        if date_value is not None:
+            payload["last_date"] = date_value.isoformat()
+        self._data[option_id] = payload
         self._persist()
+
+    def mark_completed(
+        self, option_id: str, last_date: Optional[_dt.date], status: str
+    ) -> None:
+        self.update(option_id, last_date, status=status, completed=True)
 
     def _persist(self) -> None:
         try:
@@ -300,6 +330,8 @@ class PolygonOptionsDownloader:
             "underlying_ticker": symbol,
             "limit": 100,
             "expiration_date.gte": self.history_start_date.isoformat(),
+            "order": "asc",
+            "sort": "expiration_date",
         }
         if cursor:
             params["cursor"] = cursor
@@ -425,60 +457,107 @@ class PolygonOptionsDownloader:
         expiration_date: _dt.date,
     ) -> None:
         today = _dt.datetime.now(tz=_dt.timezone.utc).date()
-        target_date = min(today, expiration_date)
-        if target_date < self.history_start_date:
+        if today <= self.history_start_date:
+            self.ohlc_progress.mark_completed(option_id, None, "sin_rango")
+            return
+
+        end_date = min(expiration_date, today - ONE_DAY)
+        if end_date < self.history_start_date:
+            self.ohlc_progress.mark_completed(option_id, end_date, "fuera_rango")
+            return
+
+        if self.ohlc_progress.is_completed(option_id, end_date):
             return
 
         last_date = self.ohlc_progress.get_last_date(option_id)
-        if last_date is not None and last_date >= target_date:
+        next_date = self.history_start_date
+        if last_date is not None:
+            next_date = max(self.history_start_date, last_date + ONE_DAY)
+
+        if next_date > end_date:
+            self.ohlc_progress.update(option_id, end_date, "actualizado", True)
             return
 
-        if self._open_close_up_to_date(cur, symbol, asset_id, option_id, target_date):
-            self.ohlc_progress.update(option_id, target_date, "ok")
-            return
+        current_date = next_date
+        while current_date <= end_date:
+            if self._open_close_up_to_date(
+                cur, symbol, asset_id, option_id, current_date
+            ):
+                self.ohlc_progress.update(
+                    option_id,
+                    current_date,
+                    "sin_cambios",
+                    completed=current_date >= end_date,
+                )
+                current_date += ONE_DAY
+                continue
 
-        date_str = target_date.isoformat()
-        self.logger.info(
-            "Descargando OHLC %s fecha=%s", option_id, date_str
-        )
-        try:
-            raw = self._fetch_open_close(option_id, date_str)
-        except FileNotFoundError:
-            self.logger.warning(
-                "OHLC no disponible para %s en fecha %s", option_id, date_str
+            date_str = current_date.isoformat()
+            self.logger.info(
+                "Descargando OHLC %s fecha=%s", option_id, date_str
             )
-            self.ohlc_progress.update(option_id, target_date, "missing")
-            return
-        except Exception as exc:  # pylint: disable=broad-except
-            raise RuntimeError(
-                f"Fallo al descargar OHLC para {option_id} {date_str}"
-            ) from exc
+            try:
+                raw = self._fetch_open_close(option_id, date_str)
+            except FileNotFoundError:
+                self.logger.warning(
+                    "OHLC no disponible para %s en fecha %s", option_id, date_str
+                )
+                self.ohlc_progress.update(
+                    option_id,
+                    current_date,
+                    "ausente",
+                    completed=current_date >= end_date,
+                )
+                current_date += ONE_DAY
+                continue
+            except Exception as exc:  # pylint: disable=broad-except
+                raise RuntimeError(
+                    f"Fallo al descargar OHLC para {option_id} {date_str}"
+                ) from exc
 
-        try:
-            ohlc_record = self._validate_ohlc(raw, option_id, symbol, asset_id)
-        except ValueError as exc:
-            self.logger.error(
-                "Datos OHLC descartados para %s: %s | Datos: %s",
+            try:
+                ohlc_record = self._validate_ohlc(raw, option_id, symbol, asset_id)
+            except ValueError as exc:
+                self.logger.error(
+                    "Datos OHLC descartados para %s: %s | Datos: %s",
+                    option_id,
+                    exc,
+                    raw,
+                )
+                self.ohlc_progress.update(
+                    option_id,
+                    current_date,
+                    "invalido",
+                    completed=current_date >= end_date,
+                )
+                current_date += ONE_DAY
+                continue
+
+            if ohlc_record.fecha_inicio.date() != current_date:
+                self.logger.error(
+                    "Fecha OHLC inesperada para %s: esperado %s recibido %s",
+                    option_id,
+                    current_date,
+                    ohlc_record.fecha_inicio.date(),
+                )
+                self.ohlc_progress.update(
+                    option_id,
+                    current_date,
+                    "desfase",
+                    completed=current_date >= end_date,
+                )
+                current_date += ONE_DAY
+                continue
+
+            self._persist_ohlc(conn, cur, ohlc_record)
+            conn.commit()
+            self.ohlc_progress.update(
                 option_id,
-                exc,
-                raw,
+                current_date,
+                "ok",
+                completed=current_date >= end_date,
             )
-            self.ohlc_progress.update(option_id, target_date, "invalid")
-            return
-
-        if ohlc_record.fecha_inicio.date() != target_date:
-            self.logger.error(
-                "Fecha OHLC inesperada para %s: esperado %s recibido %s",
-                option_id,
-                target_date,
-                ohlc_record.fecha_inicio.date(),
-            )
-            self.ohlc_progress.update(option_id, target_date, "mismatch")
-            return
-
-        self._persist_ohlc(conn, cur, ohlc_record)
-        conn.commit()
-        self.ohlc_progress.update(option_id, target_date, "ok")
+            current_date += ONE_DAY
 
     @staticmethod
     def _open_close_up_to_date(
