@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 options_progress.json
+options_ohlc_progress.json
 opciones_download.log

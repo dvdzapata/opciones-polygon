@@ -19,10 +19,12 @@ from dotenv import load_dotenv
 API_URL = "https://api.polygon.io/v3/reference/options/contracts"
 OPEN_CLOSE_URL = "https://api.polygon.io/v1/open-close"
 PROGRESS_FILE = Path("options_progress.json")
+OHLC_PROGRESS_FILE = Path("options_ohlc_progress.json")
 LOG_FILE = Path("opciones_download.log")
 RATE_LIMIT_SECONDS = 12.5
 MAX_UNDERLYINGS = 3
 FUENTE = "polygon"
+HISTORY_LOOKBACK_DAYS = 365 * 2
 
 
 @dataclass
@@ -110,6 +112,50 @@ class ProgressTracker:
             )
 
 
+class OHLCProgressTracker:
+    """Track per-option OHLC synchronization progress."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._data: Dict[str, Dict[str, Any]] = {}
+        if path.exists():
+            try:
+                self._data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                logging.getLogger(__name__).warning(
+                    "No se pudo leer progreso OHLC existente (%s): %s", path, exc
+                )
+                self._data = {}
+
+    def get_last_date(self, option_id: str) -> Optional[_dt.date]:
+        entry = self._data.get(option_id)
+        if not entry:
+            return None
+        last_date = entry.get("last_date")
+        if not last_date:
+            return None
+        try:
+            return _dt.date.fromisoformat(last_date)
+        except ValueError:
+            return None
+
+    def update(self, option_id: str, date_value: _dt.date, status: str) -> None:
+        self._data[option_id] = {
+            "last_date": date_value.isoformat(),
+            "status": status,
+            "timestamp": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+        }
+        self._persist()
+
+    def _persist(self) -> None:
+        try:
+            self._path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        except OSError as exc:
+            logging.getLogger(__name__).error(
+                "Error al guardar el progreso OHLC en %s: %s", self._path, exc
+            )
+
+
 class PolygonOptionsDownloader:
     def __init__(
         self,
@@ -118,15 +164,19 @@ class PolygonOptionsDownloader:
         db_settings: Dict[str, str],
         logger: logging.Logger,
         progress_tracker: ProgressTracker,
+        ohlc_progress_tracker: OHLCProgressTracker,
     ) -> None:
         self.api_key = api_key
         self.assets = {symbol.upper(): asset_id for symbol, asset_id in assets.items()}
         self.db_settings = db_settings
         self.logger = logger
         self.progress = progress_tracker
+        self.ohlc_progress = ohlc_progress_tracker
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
         self.last_request_timestamp: Optional[float] = None
+        today = _dt.datetime.now(tz=_dt.timezone.utc).date()
+        self.history_start_date = today - _dt.timedelta(days=HISTORY_LOOKBACK_DAYS)
 
     def run(self) -> None:
         with psycopg.connect(**self.db_settings) as conn:
@@ -135,12 +185,13 @@ class PolygonOptionsDownloader:
                 cursor = self.progress.get_cursor(symbol)
                 if cursor == "__COMPLETED__":
                     self.logger.info(
-                        "Descarga ya completada anteriormente para %s. Omitiendo.",
+                        "Descarga de contratos ya completada para %s. Reintentando OHLC.",
                         symbol,
                     )
-                    continue
-                self.progress.mark_in_progress(symbol)
-                self._download_symbol(conn, symbol, asset_id, cursor)
+                else:
+                    self.progress.mark_in_progress(symbol)
+                    self._download_symbol(conn, symbol, asset_id, cursor)
+                self._sync_open_close_for_asset(conn, symbol, asset_id)
 
     def _download_symbol(
         self,
@@ -186,6 +237,61 @@ class PolygonOptionsDownloader:
                 )
                 break
 
+    def _sync_open_close_for_asset(
+        self, conn: psycopg.Connection, symbol: str, asset_id: str
+    ) -> None:
+        symbol = symbol.upper()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id_opcion, fecha_expiracion
+                FROM opciones
+                WHERE symbol = %s AND asset_id = %s
+                ORDER BY fecha_expiracion
+                """,
+                (symbol, asset_id),
+            )
+            contracts = cur.fetchall()
+
+        if not contracts:
+            self.logger.info(
+                "Sin contratos almacenados para %s. No hay OHLC pendientes.", symbol
+            )
+            return
+
+        with conn.cursor() as cur:
+            for option_id, expiration_dt in contracts:
+                if not option_id or expiration_dt is None:
+                    self.logger.error(
+                        "Registro de contrato inválido para %s: %s", symbol, option_id
+                    )
+                    continue
+                if not isinstance(expiration_dt, _dt.datetime):
+                    self.logger.error(
+                        "fecha_expiracion inválida para %s: %s",
+                        option_id,
+                        expiration_dt,
+                    )
+                    continue
+                expiration_date = expiration_dt.date()
+                try:
+                    self._sync_option_ohlc(
+                        conn,
+                        cur,
+                        option_id=option_id,
+                        symbol=symbol,
+                        asset_id=asset_id,
+                        expiration_date=expiration_date,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    conn.rollback()
+                    self.logger.error(
+                        "Error al sincronizar OHLC para %s: %s",
+                        option_id,
+                        exc,
+                        exc_info=True,
+                    )
+
     def _fetch_contracts(
         self, symbol: str, cursor: Optional[str]
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
@@ -193,6 +299,7 @@ class PolygonOptionsDownloader:
         params: Dict[str, Any] = {
             "underlying_ticker": symbol,
             "limit": 100,
+            "expiration_date.gte": self.history_start_date.isoformat(),
         }
         if cursor:
             params["cursor"] = cursor
@@ -299,44 +406,110 @@ class PolygonOptionsDownloader:
         cur: psycopg.Cursor,
         record: OptionRecord,
     ) -> None:
-        if self._open_close_exists(cur, record):
+        self._sync_option_ohlc(
+            conn,
+            cur,
+            option_id=record.id_opcion,
+            symbol=record.symbol,
+            asset_id=record.asset_id,
+            expiration_date=record.fecha_expiracion.date(),
+        )
+
+    def _sync_option_ohlc(
+        self,
+        conn: psycopg.Connection,
+        cur: psycopg.Cursor,
+        option_id: str,
+        symbol: str,
+        asset_id: str,
+        expiration_date: _dt.date,
+    ) -> None:
+        today = _dt.datetime.now(tz=_dt.timezone.utc).date()
+        target_date = min(today, expiration_date)
+        if target_date < self.history_start_date:
             return
-        date_str = record.fecha_expiracion.date().isoformat()
+
+        last_date = self.ohlc_progress.get_last_date(option_id)
+        if last_date is not None and last_date >= target_date:
+            return
+
+        if self._open_close_up_to_date(cur, symbol, asset_id, option_id, target_date):
+            self.ohlc_progress.update(option_id, target_date, "ok")
+            return
+
+        date_str = target_date.isoformat()
+        self.logger.info(
+            "Descargando OHLC %s fecha=%s", option_id, date_str
+        )
         try:
-            raw = self._fetch_open_close(record.id_opcion, date_str)
+            raw = self._fetch_open_close(option_id, date_str)
         except FileNotFoundError:
             self.logger.warning(
-                "OHLC no disponible para %s en fecha %s", record.id_opcion, date_str
+                "OHLC no disponible para %s en fecha %s", option_id, date_str
             )
+            self.ohlc_progress.update(option_id, target_date, "missing")
             return
         except Exception as exc:  # pylint: disable=broad-except
             raise RuntimeError(
-                f"Fallo al descargar OHLC para {record.id_opcion} {date_str}"
+                f"Fallo al descargar OHLC para {option_id} {date_str}"
             ) from exc
+
         try:
-            ohlc_record = self._validate_ohlc(raw, record)
+            ohlc_record = self._validate_ohlc(raw, option_id, symbol, asset_id)
         except ValueError as exc:
             self.logger.error(
                 "Datos OHLC descartados para %s: %s | Datos: %s",
-                record.id_opcion,
+                option_id,
                 exc,
                 raw,
             )
+            self.ohlc_progress.update(option_id, target_date, "invalid")
             return
+
+        if ohlc_record.fecha_inicio.date() != target_date:
+            self.logger.error(
+                "Fecha OHLC inesperada para %s: esperado %s recibido %s",
+                option_id,
+                target_date,
+                ohlc_record.fecha_inicio.date(),
+            )
+            self.ohlc_progress.update(option_id, target_date, "mismatch")
+            return
+
         self._persist_ohlc(conn, cur, ohlc_record)
+        conn.commit()
+        self.ohlc_progress.update(option_id, target_date, "ok")
 
     @staticmethod
-    def _open_close_exists(cur: psycopg.Cursor, record: OptionRecord) -> bool:
+    def _open_close_up_to_date(
+        cur: psycopg.Cursor,
+        symbol: str,
+        asset_id: str,
+        option_id: str,
+        target_date: _dt.date,
+    ) -> bool:
         cur.execute(
             """
-            SELECT 1
+            SELECT fecha_inicio
             FROM opciones_ohlc
             WHERE symbol = %s AND asset_id = %s AND id_opcion = %s
-            LIMIT 1
             """,
-            (record.symbol, record.asset_id, record.id_opcion),
+            (symbol, asset_id, option_id),
         )
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        if not row:
+            return False
+        stored_date = row[0]
+        if isinstance(stored_date, _dt.datetime):
+            stored_date = stored_date.date()
+        elif isinstance(stored_date, str):
+            try:
+                stored_date = _dt.date.fromisoformat(stored_date)
+            except ValueError:
+                return False
+        else:
+            return False
+        return stored_date >= target_date
 
     def _fetch_open_close(self, option_ticker: str, date_str: str) -> Dict[str, Any]:
         self._respect_rate_limit()
@@ -351,10 +524,10 @@ class PolygonOptionsDownloader:
         return response.json()
 
     def _validate_ohlc(
-        self, payload: Dict[str, Any], contract: OptionRecord
+        self, payload: Dict[str, Any], option_id: str, symbol: str, asset_id: str
     ) -> OptionOHLCRecord:
         option_symbol = payload.get("symbol")
-        if option_symbol != contract.id_opcion:
+        if option_symbol != option_id:
             raise ValueError("symbol del OHLC no coincide con id_opcion")
 
         from_value = payload.get("from")
@@ -379,7 +552,7 @@ class PolygonOptionsDownloader:
 
         return OptionOHLCRecord(
             fecha_inicio=fecha_inicio,
-            id_opcion=contract.id_opcion,
+            id_opcion=option_id,
             open=self._optional_decimal(payload.get("open"), "open"),
             high=self._optional_decimal(payload.get("high"), "high"),
             low=self._optional_decimal(payload.get("low"), "low"),
@@ -392,8 +565,8 @@ class PolygonOptionsDownloader:
             ),
             volume=volume_value,
             status=status_value,
-            symbol=contract.symbol,
-            asset_id=contract.asset_id,
+            symbol=symbol,
+            asset_id=asset_id,
         )
 
     def _persist_ohlc(
@@ -686,12 +859,14 @@ def main() -> None:
         sys.exit(1)
 
     progress_tracker = ProgressTracker(PROGRESS_FILE)
+    ohlc_progress_tracker = OHLCProgressTracker(OHLC_PROGRESS_FILE)
     downloader = PolygonOptionsDownloader(
         api_key=api_key,
         assets=assets,
         db_settings=db_settings,
         logger=logger,
         progress_tracker=progress_tracker,
+        ohlc_progress_tracker=ohlc_progress_tracker,
     )
     try:
         downloader.run()
